@@ -25,6 +25,26 @@ You can give parameters via a configuration file, or from environment variables.
 
     Process-wide routing fallbacks such as `litellm.api_base`, `litellm.api_version`, `litellm.organization`, `litellm.vertex_project`, and `litellm.vertex_location` can be rejected even when unchanged. Use the corresponding PR-Agent settings (`OPENAI.API_BASE`, `OPENAI.API_VERSION`, `OPENAI.ORG`, `VERTEXAI.VERTEX_PROJECT`, and `VERTEXAI.VERTEX_LOCATION`) or supported provider environment variables, and clear the corresponding LiteLLM globals even when they match the intended routing. Use `LITELLM.EXTRA_HEADERS` instead of `litellm.headers`.
 
+### Fireworks reasoning token budget
+
+For `fireworks_ai/accounts/fireworks/models/deepseek-v4p1-flash`,
+`config.reasoning_effort` also accepts a positive integer. Fireworks interprets
+this as a hard thinking-token budget. Set `config.max_output_tokens` to a larger
+integer to leave room for the final answer:
+
+```toml
+[config]
+model = "fireworks_ai/accounts/fireworks/models/deepseek-v4p1-flash"
+reasoning_effort = 16384
+max_output_tokens = 32768
+```
+
+Numeric budgets are supported only for this verified provider/model pair.
+Named levels retain their existing behavior. This does not broaden
+`LITELLM.EXTRA_BODY` or override its parameter restrictions.
+See the [Fireworks parameter reference](https://docs.fireworks.ai/api-reference/post-chatcompletions#body-reasoning-effort).
+
+
 ### OpenAI like API
 
 To use an OpenAI like API, set the following in your `.secrets.toml` file:

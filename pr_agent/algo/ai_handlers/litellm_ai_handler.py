@@ -140,6 +140,9 @@ from pr_agent.log import get_logger
 
 MODEL_RETRIES = 2
 _IMAGE_HEAD_TIMEOUT_SECONDS = 5
+FIREWORKS_REASONING_BUDGET_MODELS = frozenset({
+    "fireworks_ai/accounts/fireworks/models/deepseek-v4p1-flash",
+})
 OPENAI_DEFAULT_API_BASE = "https://api.openai.com/v1"
 
 PROVIDER_SETTING_PATHS = {
@@ -1815,8 +1818,15 @@ class LiteLLMAIHandler(BaseAiHandler):
             return "xhigh" if "xhigh" in grok_levels else "high"
         return "low"
 
-    def _resolve_reasoning_effort(self, model: str, configured_effort) -> str:
+    def _resolve_reasoning_effort(self, model: str, configured_effort) -> str | int:
         """Validate and normalize a configured reasoning effort for this model."""
+        if type(configured_effort) is int:
+            if model not in FIREWORKS_REASONING_BUDGET_MODELS:
+                raise ValueError(f"Numeric reasoning_effort is not supported for {model}")
+            output_limit = get_settings().config.get("max_output_tokens", None)
+            if type(output_limit) is not int or not 0 < configured_effort < output_limit:
+                raise ValueError("Numeric reasoning_effort must be positive and less than config.max_output_tokens")
+            return configured_effort
         try:
             ReasoningEffort(configured_effort)
             reasoning_effort = configured_effort
@@ -2531,6 +2541,7 @@ class LiteLLMAIHandler(BaseAiHandler):
                 # reasoning_effort normalization of its dedicated branch.
                 if not (is_gpt5_model or is_gpt6_astra) and (
                     self._grok_reasoning_levels_for(reasoning_model) is not None
+                    or reasoning_model in FIREWORKS_REASONING_BUDGET_MODELS
                     or not self._is_claude_family_model(reasoning_model)
                     and self._litellm_supports_reasoning(reasoning_model)
                     or any(
