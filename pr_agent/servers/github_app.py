@@ -2,7 +2,7 @@ import copy
 import os
 import time
 import uuid
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import uvicorn
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
@@ -110,6 +110,16 @@ async def get_body(request):
     return body
 
 
+def _reformat_quote_ask_command(comment_body: str) -> Optional[str]:
+    """Move a /ask command buried in a quoted Golf/mobile reply to the front so it
+    is dispatched, preserving the whole question text. Returns None when the
+    comment is not an image-quote reply carrying a /ask."""
+    if '/ask' not in comment_body or not comment_body.strip().startswith('> ![image]'):
+        return None
+    before, _, after = comment_body.partition('/ask')
+    return '/ask' + after + ' \n' + before.strip().lstrip('>')
+
+
 async def handle_comments_on_pr(body: Dict[str, Any],
                                 event: str,
                                 sender: str,
@@ -121,9 +131,9 @@ async def handle_comments_on_pr(body: Dict[str, Any],
         return {}
     comment_body = body.get("comment", {}).get("body")
     if comment_body and isinstance(comment_body, str) and not comment_body.lstrip().startswith("/"):
-        if '/ask' in comment_body and comment_body.strip().startswith('> ![image]'):
-            comment_body_split = comment_body.split('/ask')
-            comment_body = '/ask' + comment_body_split[1] +' \n' +comment_body_split[0].strip().lstrip('>')
+        reformatted = _reformat_quote_ask_command(comment_body) if '/ask' in comment_body else None
+        if reformatted is not None:
+            comment_body = reformatted
             get_logger().info(f"Reformatting comment_body so command is at the beginning: {comment_body}")
         else:
             get_logger().info("Ignoring comment not starting with /")
@@ -315,7 +325,9 @@ async def handle_push_trigger_for_new_commits(body: Dict[str, Any],
     if not (pull_request and api_url):
         return {}
 
-    apply_repo_settings(api_url) # we need to apply the repo settings to get the correct settings for the PR. This is quite expensive - a call to the git provider is made for each PR event.
+    # we need to apply the repo settings to get the correct settings for the PR.
+    # This is quite expensive - a call to the git provider is made for each PR event.
+    apply_repo_settings(api_url)
     if not get_settings().github_app.handle_push_trigger:
         return {}
 
@@ -444,7 +456,7 @@ async def handle_request(body: Dict[str, Any], event: str, delivery_id: str | No
         event: The GitHub event type (e.g. "pull_request", "issue_comment", etc.).
         delivery_id: GitHub's stable identifier for this webhook delivery and its redeliveries.
     """
-    action = body.get("action")  # "created", "opened", "reopened", "ready_for_review", "review_requested", "synchronize"
+    action = body.get("action") # "created", "opened", "reopened", "ready_for_review", "review_requested", "synchronize"
     get_logger().debug(f"Handling request with event: {event}, action: {action}")
     if not action:
         get_logger().debug("No action found in request body, exiting handle_request")
@@ -473,7 +485,10 @@ def handle_line_comments(body: Dict, comment_body: [str, Any]):
     start_line = body["comment"]["start_line"] or body["comment"].get("original_start_line")
     end_line = body["comment"]["line"] or body["comment"].get("original_line")
     start_line = end_line if not start_line else start_line
-    question = comment_body.replace('/ask', '').strip()
+    # Strip only the leading command. str.replace() would also remove "/ask" from
+    # inside the question, mangling text such as "/ask how do I call /ask_line?".
+    # gitlab_webhook.handle_ask_line() is the reference for this contract.
+    question = comment_body.strip().removeprefix('/ask').strip()
     diff_hunk = body["comment"]["diff_hunk"]
     get_settings().set("ask_diff_hunk", diff_hunk)
     path = body["comment"]["path"]
@@ -482,7 +497,7 @@ def handle_line_comments(body: Dict, comment_body: [str, Any]):
     if '/ask' in comment_body:
         # Build an argv list rather than concatenating into a shell-style
         # command string. PRAgent._handle_request() tokenises string requests
-        # with shlex.shlex after escaping single quotes, which neutralises any
+        # with single quotes treated literally, which neutralises any
         # shlex.quote() output and re-introduces the CLI-argument injection
         # vector (a quoted value containing whitespace splits into multiple
         # argv tokens). Passing a list bypasses the shlex path entirely.
@@ -511,7 +526,8 @@ def _check_pull_request_event(action: str, body: dict, log_context: dict) -> Tup
     log_context["api_url"] = api_url
     if pull_request.get("state") != "open":
         return invalid_result
-    if action in ("review_requested", "synchronize") and pull_request.get("created_at") == pull_request.get("updated_at"):
+    if (action in ("review_requested", "synchronize")
+            and pull_request.get("created_at") == pull_request.get("updated_at")):
         # avoid double reviews when opening a PR for the first time
         return invalid_result
     return pull_request, api_url
@@ -543,11 +559,19 @@ async def _perform_auto_commands_github(commands_conf: str, agent: PRAgent, body
         return
     get_settings().set("config.is_auto_command", True)
     provider = _check_run_provider(api_url)
+    try:
+        command_provider = get_git_provider_with_context(pr_url=api_url)
+    except Exception as e:
+        get_logger().warning(f"Cannot access the GitHub provider for cache reset, {api_url=}: {e}")
+        command_provider = None
     succeeded = True
     for command in commands:
         check_run = None
         command_succeeded = True
         try:
+            reset_diff_cache = getattr(command_provider, "reset_diff_cache_for_command", None)
+            if callable(reset_diff_cache):
+                reset_diff_cache()
             new_command = prepare_command(command)
             get_logger().info(f"{commands_conf}. Performing auto command '{new_command}', for {api_url=}")
             check_run = _start_auto_command_check_run(provider, new_command)

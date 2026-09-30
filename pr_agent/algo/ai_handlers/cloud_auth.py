@@ -84,7 +84,7 @@ PROVIDER_SETTING_ALIASES = {
     "text-completion-openai": "openai",
     "vertex_ai_beta": "vertex_ai",
 }
-# Keep chat-completion endpoint aliases in the same precedence order as LiteLLM 1.101.0.
+# Keep chat-completion endpoint aliases in LiteLLM's precedence order.
 # Native completion masks BASETEN_API_BASE, MISTRAL_API_BASE and ARK_API_BASE;
 # VERTEX_API_BASE belongs to embedding, not chat. Do not promote them to explicit routing.
 PROVIDER_API_BASE_ENV_VARS = {
@@ -208,7 +208,7 @@ PROVIDER_ROUTING_ENV_VARS = {
     "watsonx_text": dict(_WATSONX_ROUTING_ENV_VARS),
 }
 
-# Keep aliases in the same precedence order as LiteLLM 1.101.0.
+# Keep API key aliases in LiteLLM's precedence order.
 PROVIDER_API_KEY_ENV_VARS = {
     "ai21": ("AI21_API_KEY",),
     "ai21_chat": ("AI21_API_KEY",),
@@ -379,6 +379,15 @@ def _require_litellm_interface(interface, name: str, methods=()):
         )
 
 
+def _rebind_to_globals(native, native_globals):
+    """Rebind a native function onto captured globals, keeping its own defaults."""
+    bound = FunctionType(
+        native.__code__, native_globals, native.__name__, native.__defaults__, native.__closure__,
+    )
+    bound.__kwdefaults__ = copy.copy(native.__kwdefaults__)
+    return bound
+
+
 _azure_oidc_request = ContextVar("pr_agent_azure_oidc_request", default=None)
 _azure_ad_responses_request = ContextVar("pr_agent_azure_ad_responses_request", default=None)
 _azure_oidc_bridge = None
@@ -433,8 +442,7 @@ def _exchange_azure_oidc_token(selector, environment, native=None):
     # and refresh/TTL behavior. Only the outer exchange's inputs are request-owned.
     native_globals["os"] = SimpleNamespace(getenv=captured_getenv)
     native_globals["azure_ad_cache"] = SimpleNamespace(get_cache=get_cache, set_cache=set_cache)
-    exchange = FunctionType(native.__code__, native_globals, native.__name__, native.__defaults__, native.__closure__)
-    exchange.__kwdefaults__ = copy.copy(native.__kwdefaults__)
+    exchange = _rebind_to_globals(native, native_globals)
     return exchange(
         selector,
         azure_client_id=environment["AZURE_CLIENT_ID"],
@@ -476,11 +484,7 @@ def _azure_oidc_companion_globals(native_globals, context):
         # Retain native secret-selector resolution, but never use the native
         # authority-free provider cache. Credentials retain authority on refresh.
         globals_view = {**original_entra.__globals__, "_cached_entra_id_token_provider": cached}
-        factory = FunctionType(
-            original_entra.__code__, globals_view, original_entra.__name__,
-            original_entra.__defaults__, original_entra.__closure__,
-        )
-        factory.__kwdefaults__ = copy.copy(original_entra.__kwdefaults__)
+        factory = _rebind_to_globals(original_entra, globals_view)
         return factory(tenant_id, client_id, client_secret, scope)
 
     def password(client_id, azure_username, azure_password, scope="https://cognitiveservices.azure.com/.default"):
@@ -504,6 +508,9 @@ def _azure_oidc_companion_globals(native_globals, context):
                            "configure complete companion credentials instead")
 
     native_globals["get_azure_ad_token_provider"] = reject_implicit_refresh
+    if not callable(native_globals.get("_cached_azure_ad_token_refresh_provider")):
+        raise RuntimeError("LiteLLM's Azure AD refresh provider interface is incompatible")
+    native_globals["_cached_azure_ad_token_refresh_provider"] = reject_implicit_refresh
     return native_globals
 
 
@@ -571,11 +578,7 @@ def _install_azure_oidc_bridge():
         native_globals["os"] = SimpleNamespace(getenv=getenv)
         native_globals["get_secret_str"] = get_secret_str
         native_globals["get_azure_ad_token_from_oidc"] = exchange
-        bound = FunctionType(
-            original_resolver.__code__, native_globals, original_resolver.__name__,
-            original_resolver.__defaults__, original_resolver.__closure__,
-        )
-        bound.__kwdefaults__ = copy.copy(original_resolver.__kwdefaults__)
+        bound = _rebind_to_globals(original_resolver, native_globals)
         return bound(litellm_params)
 
     @wraps(original_resolver)
@@ -619,11 +622,7 @@ def _install_azure_oidc_bridge():
         ):
             return original_initialize(*args, **kwargs)
         native_globals = _azure_oidc_companion_globals(original_initialize.__globals__, context)
-        factory = FunctionType(
-            original_initialize.__code__, native_globals, original_initialize.__name__,
-            original_initialize.__defaults__, original_initialize.__closure__,
-        )
-        factory.__kwdefaults__ = copy.copy(original_initialize.__kwdefaults__)
+        factory = _rebind_to_globals(original_initialize, native_globals)
         return factory(*args, **kwargs)
 
     @wraps(original_cache_key)
@@ -983,7 +982,7 @@ def _get_bedrock_model_region(model: str, model_id=None) -> str | None:
     """Resolve only the region carried by the request, without ambient AWS discovery."""
     from litellm.llms.bedrock.common_utils import BedrockModelInfo
 
-    # LiteLLM 1.101.0 consumes model_id before Invoke resolves its region.
+    # LiteLLM consumes model_id before Invoke resolves its region.
     # Only Converse uses that separate ID or region/model path for routing.
     is_converse = BedrockModelInfo.get_bedrock_route(model) == "converse"
     if not is_converse:
@@ -999,7 +998,7 @@ def _get_bedrock_model_region(model: str, model_id=None) -> str | None:
     arn_candidate = candidate
     if not model_id:
         arn_candidate = arn_candidate.removeprefix("invoke/")
-        # Match the native chat model prefixes in LiteLLM 1.101.0 without
+        # Match LiteLLM's native chat model prefixes without
         # decoding an ARN or changing Converse's region/model path grammar.
         for prefix in ("llama/", "deepseek_r1/", "openai/", "qwen2/", "qwen3/", "moonshot/", "nova-2/", "nova/"):
             if arn_candidate.startswith(prefix):
@@ -1069,7 +1068,7 @@ def _guard_request_routing_globals(provider: str | None, params: dict) -> dict:
             and parameter in params
             and live_value != params[parameter]
         ):
-            # LiteLLM 1.101.0's ChatGPT chat transformation ignores the request
+            # LiteLLM's ChatGPT chat transformation ignores the request
             # api_base and re-reads these variables when resolving provider info.
             raise ValueError("Refusing changed live api_base environment for provider chatgpt")
     return params
@@ -1212,6 +1211,14 @@ def _raw_guard_has_header_only_auth(provider, params, headers):
     return not ((tenant and client and secret) or (username and password and client))
 
 
+def _require_http_auth_signature(original):
+    """Reject a native HTTP validator that no longer exposes the request auth parameters."""
+    signature = inspect.signature(original)
+    if not {"api_key", "headers", "litellm_params"}.issubset(signature.parameters):
+        raise RuntimeError("LiteLLM's native HTTP authentication interface is incompatible")
+    return signature
+
+
 def _install_raw_api_key_guard_override_bridge(provider):
     """Undo generated auth headers without reopening a native key resolver."""
     if provider not in ("azure_ai", "ragflow", "xai"):
@@ -1225,9 +1232,7 @@ def _install_raw_api_key_guard_override_bridge(provider):
     marker = "_pr_agent_original_raw_override_validate_environment"
     if getattr(original, marker, None) is not None:
         return
-    signature = inspect.signature(original)
-    if not {"api_key", "headers", "litellm_params"}.issubset(signature.parameters):
-        raise RuntimeError("LiteLLM's native HTTP authentication interface is incompatible")
+    signature = _require_http_auth_signature(original)
 
     def validate_environment(self, *args, **kwargs):
         if _raw_api_key_guard_provider.get() != provider or type(self) is not config:
@@ -1281,9 +1286,7 @@ def _install_raw_api_key_guard_bridge():
     marker = "_pr_agent_original_raw_validate_environment"
     if getattr(original, marker, None) is not None:
         return
-    signature = inspect.signature(original)
-    if not {"api_key", "headers", "litellm_params"}.issubset(signature.parameters):
-        raise RuntimeError("LiteLLM's native HTTP authentication interface is incompatible")
+    signature = _require_http_auth_signature(original)
 
     def validate_environment(self, *args, **kwargs):
         provider = _raw_api_key_guard_provider.get()
@@ -1583,7 +1586,7 @@ def _install_vertex_executable_guard():
         setattr(guarded, marker, original)
         return guarded
 
-    # LiteLLM 1.101.0 reads expired (sync) or token_state (async) on the
+    # LiteLLM reads expired (sync) or token_state (async) on the
     # actual cached credential before returning its token. Guarding the
     # descriptors also covers cache replacement during an async lock wait.
     for name in ("from_info", "refresh", "expired", "token_state"):
@@ -1610,7 +1613,13 @@ def _install_vertex_executable_guard():
 
 
 def _install_vertex_wif_project_bridge():
-    """Restore ADC project discovery for request-owned WIF JSON in LiteLLM 1.101.0."""
+    """Restore ADC project discovery for request-owned WIF JSON.
+
+    Remove this bridge when LiteLLM discovers WIF projects without ambient ADC
+    or quota overrides, binds each handler's captured AWS identity without
+    consulting later process AWS settings, and reuses the resulting WIF
+    credential for cache and refresh.
+    """
     from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 
     original = VertexBase.load_auth
@@ -1629,7 +1638,7 @@ def _install_vertex_wif_project_bridge():
         if json_obj != snapshot:
             return original(self, credentials, project_id)
 
-        # Preserve LiteLLM 1.101.0's WIF factories, including its explicit AWS
+        # Preserve LiteLLM's WIF factories, including its explicit AWS
         # supplier. Only project discovery is missing from its JSON load path.
         scopes = ["https://www.googleapis.com/auth/cloud-platform"]
         source = json_obj.get("credential_source", {})
@@ -1671,7 +1680,11 @@ def _install_vertex_wif_project_bridge():
 
 
 def _install_vertex_impersonated_credentials_bridge():
-    """Add LiteLLM 1.101.0's missing ADC type without replacing its refresh/cache path."""
+    """Load request-owned impersonated ADC without ambient quota overrides.
+
+    Remove this bridge when LiteLLM handles this ADC type from captured
+    credentials without reading live quota settings.
+    """
     from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 
     original = VertexBase._credentials_from_service_account

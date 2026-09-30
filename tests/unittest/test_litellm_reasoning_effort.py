@@ -10,6 +10,8 @@ import pr_agent.algo.ai_handlers.litellm_ai_handler as litellm_handler
 from pr_agent.algo import token_budget
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 
+ACOMPLETION_PATCH_TARGET = 'pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion'
+
 
 @pytest.mark.parametrize("budget", [1, 16384, 32767])
 async def test_fireworks_numeric_budget_reaches_provider(monkeypatch, budget):
@@ -95,15 +97,11 @@ def mock_logger():
 def _pin_reasoning_support_metadata(monkeypatch):
     """Pin the reasoning-support metadata this suite keys off.
 
-    CI runs litellm 1.99.0 and 1.101.0 in parallel and their bundled cost maps
-    differ, so the regression matrix forces the entries the reasoning_effort gate
-    consults in ``litellm.model_cost``: bare o3/o4/Gemini-2.5 ids register
-    directly and claude-sonnet-4-5 / claude-haiku-4-5 report True while the
-    handler's claude-family check still keeps them out of the reasoning_effort
-    path. The six Grok ids are not pinned here: the gate recognizes them through
-    the GROK_REASONING_EFFORT_LEVELS registry, so their coverage does not depend
-    on the bundled map (xai/grok-build-latest is absent from the 1.99.0 map).
-    All other bundled entries stay untouched.
+    Keep reasoning-effort cases independent of LiteLLM's bundled cost map.
+    Bare o3/o4/Gemini-2.5 ids and Claude family entries are marked as
+    reasoning-capable; the handler still excludes Claude from the generic
+    reasoning-effort path. Grok uses GROK_REASONING_EFFORT_LEVELS, so this
+    fixture leaves its entries alone. All other bundled entries stay untouched.
     """
     reasoning_models = (
         "o3-mini", "o3-mini-2025-01-31", "o3", "o3-2025-04-16",
@@ -197,7 +195,7 @@ class TestLiteLLMReasoningEffort:
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
         # Mock acompletion to capture kwargs
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -222,7 +220,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings("low")
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -243,7 +241,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings("medium")
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -264,7 +262,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings("high")
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -285,7 +283,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings("xhigh")
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -340,12 +338,39 @@ class TestLiteLLMReasoningEffort:
         assert lookups == ["gpt-5.2" if "gpt-5.2" in model else "gpt-5.1-codex"]
 
     @pytest.mark.asyncio
+    async def test_gpt5_branch_does_not_apply_the_grok_clamp(self, monkeypatch, mock_logger):
+        """Guard the GPT-5/Astra path from applying the Grok reasoning-effort clamp.
+
+        The model ID satisfies both matchers on purpose; no known shipped ID does. Routing this path
+        through _resolve_reasoning_effort() would cap 'max' at grok-4.5's 'high' instead of
+        converting it to 'xhigh'. Real-model tests cannot reach that overlap, so a later dedup could
+        reintroduce the clamp silently.
+        """
+        model = "gpt-5.2/grok-4.5"
+        grok_levels = LiteLLMAIHandler._grok_reasoning_levels_for(model)
+        assert LiteLLMAIHandler._is_gpt5_model(model)
+        assert grok_levels and "xhigh" not in grok_levels
+        fake_settings = create_mock_settings("max")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(litellm, "get_model_info", lambda lookup_model: {})
+        with patch(
+            "pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion",
+            new_callable=AsyncMock,
+        ) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model=model, system="test system", user="test user")
+
+        assert mock_completion.call_args[1]["reasoning_effort"] == "xhigh"
+
+    @pytest.mark.asyncio
     async def test_gpt5_valid_reasoning_effort_minimal(self, monkeypatch, mock_logger):
         """Test GPT-5 with valid reasoning_effort='minimal' from config."""
         fake_settings = create_mock_settings("minimal")
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -360,6 +385,46 @@ class TestLiteLLMReasoningEffort:
             assert "reasoning_effort" in call_kwargs["allowed_openai_params"]
             mock_logger.info.assert_any_call("Using reasoning_effort='minimal' for GPT-5 model")
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("model", "lookup_model", "model_info", "expected_effort"),
+        [
+            ("openai/azure/gpt-5.2_thinking", "gpt-5.2", {"supports_minimal_reasoning_effort": False}, "low"),
+            ("gpt-5.4", "gpt-5.4", {"supports_minimal_reasoning_effort": False}, "low"),
+            ("gpt-5.2", "gpt-5.2", {"supports_minimal_reasoning_effort": True}, "minimal"),
+            ("gpt-5.2", "gpt-5.2", {}, "minimal"),
+            ("gpt-5.2", "gpt-5.2", LookupError("unavailable"), "minimal"),
+        ],
+    )
+    async def test_gpt5_reasoning_effort_minimal_uses_minimal_metadata(
+        self, monkeypatch, mock_logger, model, lookup_model, model_info, expected_effort,
+    ):
+        """Clamp minimal to low when the model map rejects it, else keep it."""
+        fake_settings = create_mock_settings("minimal")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        lookups = []
+
+        def get_model_info(lookup):
+            lookups.append(lookup)
+            if isinstance(model_info, Exception):
+                raise model_info
+            return model_info
+
+        monkeypatch.setattr(litellm, "get_model_info", get_model_info)
+        with patch(
+            "pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion",
+            new_callable=AsyncMock,
+        ) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model=model, system="test system", user="test user")
+
+        call_kwargs = mock_completion.call_args[1]
+        assert call_kwargs["reasoning_effort"] == expected_effort
+        assert "reasoning_effort" in call_kwargs["allowed_openai_params"]
+        assert lookups == [lookup_model]
+
     # ========== Group 2: Invalid Configuration Tests ==========
 
     @pytest.mark.asyncio
@@ -368,7 +433,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings("extreme")
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -397,7 +462,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings("invalid_value")
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -423,7 +488,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings(None)
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -449,7 +514,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings(None)
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -498,7 +563,7 @@ class TestLiteLLMReasoningEffort:
         ]
 
         for model in gpt5_models:
-            with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
                 mock_completion.return_value = create_mock_acompletion_response()
 
                 handler = LiteLLMAIHandler()
@@ -522,7 +587,7 @@ class TestLiteLLMReasoningEffort:
         non_gpt5_models = ["gpt-4o", "gpt-4-turbo", "claude-3-5-sonnet"]
 
         for model in non_gpt5_models:
-            with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
                 mock_completion.return_value = create_mock_acompletion_response()
 
                 handler = LiteLLMAIHandler()
@@ -542,7 +607,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings("low")
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -564,7 +629,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings(None)
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -584,7 +649,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings(None)
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -604,7 +669,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings("high")
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -627,7 +692,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings("low")
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -646,7 +711,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings(None)
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -666,7 +731,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings(None)
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -686,7 +751,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings("ultra")
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -707,7 +772,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings("medium")
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -732,7 +797,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings("high")
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -746,7 +811,10 @@ class TestLiteLLMReasoningEffort:
 
             # Should not have reasoning_effort keys
             assert "reasoning_effort" not in call_kwargs
-            assert call_kwargs.get("allowed_openai_params") is None or "reasoning_effort" not in call_kwargs.get("allowed_openai_params", [])
+            assert (
+                call_kwargs.get("allowed_openai_params") is None
+                or "reasoning_effort" not in call_kwargs.get("allowed_openai_params", [])
+            )
 
     # ========== Group 7: Edge Cases ==========
 
@@ -756,7 +824,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings("")
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -777,7 +845,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings("LOW")
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -798,7 +866,7 @@ class TestLiteLLMReasoningEffort:
         fake_settings = create_mock_settings(" low ")
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -825,7 +893,7 @@ class TestLiteLLMReasoningEffort:
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
 
         # Test gpt-50 (will match due to startswith logic)
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -843,7 +911,7 @@ class TestLiteLLMReasoningEffort:
         mock_logger.reset_mock()
 
         # Test gpt-5 (should match)
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -1101,7 +1169,7 @@ class TestLiteLLMReasoningEffortGemini:
         ]
 
         for model in gemini_models:
-            with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
                 mock_completion.return_value = create_mock_acompletion_response()
 
                 handler = LiteLLMAIHandler()
@@ -1133,7 +1201,7 @@ class TestLiteLLMReasoningEffortGemini:
             "gemini/gemini-3.1-pro",
             "gemini-3.5-pro",
         ):
-            with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
                 mock_completion.return_value = create_mock_acompletion_response()
 
                 handler = LiteLLMAIHandler()
@@ -1150,7 +1218,7 @@ class TestLiteLLMReasoningEffortGemini:
         self._isolate_env(monkeypatch)
 
         # "my-gemini-2.5-pro" is not equal to and does not end with "/gemini-2.5-pro".
-        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
             mock_completion.return_value = create_mock_acompletion_response()
 
             handler = LiteLLMAIHandler()
@@ -1354,6 +1422,26 @@ class TestLiteLLMReasoningEffortGrok:
         assert LiteLLMAIHandler._clamp_grok_reasoning_effort(model, configured) == expected
 
     @pytest.mark.parametrize(
+        ("model", "configured", "expected"),
+        [
+            ("gemini/gemini-3.7-flash", "minimal", "low"),
+            ("vertex_ai/gemini-3.7-flash", "minimal", "low"),
+            ("openrouter/google/gemini-3.7-flash", "minimal", "low"),
+            ("gemini/gemini-3.8-flash", "minimal", "low"),
+            ("vertex_ai/gemini-3.8-flash", "minimal", "low"),
+            ("openrouter/google/gemini-3.8-flash", "minimal", "low"),
+            ("openrouter/google/gemini-3.8-flash:nitro", "minimal", "low"),
+            ("gemini/gemini-3.7-flash", "low", "low"),
+            ("gemini/gemini-3.7-flash", "medium", "medium"),
+            ("gemini/gemini-3.7-flash", "high", "high"),
+            ("gemini/gemini-2.5-pro", "minimal", "minimal"),
+        ],
+    )
+    def test_resolve_reasoning_effort_clamps_gemini_minimal(self, model, configured, expected):
+        handler = object.__new__(LiteLLMAIHandler)
+        assert handler._resolve_reasoning_effort(model, configured) == expected
+
+    @pytest.mark.parametrize(
         ("model", "effort"),
         [
             ("grok-4.5", "low"),
@@ -1421,7 +1509,9 @@ class TestLiteLLMReasoningEffortGrok:
         monkeypatch.setattr(
             litellm,
             "get_supported_openai_params",
-            lambda **kwargs: [] if kwargs["model"].endswith("grok-build-latest") else ["reasoning_effort"],
+            lambda **kwargs: ["temperature"]
+            if kwargs["model"].endswith("grok-build-latest")
+            else ["reasoning_effort", "temperature"],
         )
         call_kwargs = await self._run(monkeypatch, model, global_effort="low")
 
@@ -1469,7 +1559,11 @@ class TestLiteLLMReasoningEffortGrok:
         assert call_kwargs["reasoning_effort"] == "xhigh"
         assert call_kwargs["allowed_openai_params"] == ["reasoning_effort"]
         assert call_kwargs["custom_llm_provider"] == "openai"
-        probe.assert_called_once_with(model="grok-4.6", custom_llm_provider="openai")
+        assert "temperature" not in call_kwargs
+        assert any(
+            call.kwargs == {"model": "grok-4.6", "custom_llm_provider": "openai"}
+            for call in probe.call_args_list
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

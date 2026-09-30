@@ -1,4 +1,7 @@
-## MOSAICO A2A server
+---
+title: "MOSAICO A2A Server"
+sidebar_position: 9
+---
 
 PR-Agent can run as an [A2A](https://a2a-protocol.org/) 1.0 *solution agent* for the
 [MOSAICO](https://mosaico-project.eu/) ecosystem: a small Starlette server that exposes the
@@ -6,7 +9,11 @@ standard A2A surface (agent card + JSON-RPC) plus a health probe. It is **not** 
 separate project — the server is PR-Agent code under [`pr_agent/mosaico/`](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/mosaico/server.py),
 ships in every release wheel, and ships as its own Docker image (`<version>-mosaico_agent`)
 starting at `v0.36.0`. The server is unbiased about the git provider: every request carries
-either a PR URL or a raw diff, and the agent answers from that input alone.
+either a PR URL or a raw diff. Follow-up messages can refer to that input by reusing the
+returned `contextId`; the server considers up to 100 prior tasks in the same context by default
+to find the latest PR URL or diff. Set `mosaico.context_history_max_tasks` (1 to 1000) to change
+this limit. Task history is kept in memory, so send the input again after a restart or
+when routing a follow-up to a different server replica.
 
 ### What the mode is
 
@@ -67,21 +74,22 @@ rolling tag moves to the newest build on every release.
 | `MODEL_MAX_TOKENS` | `32000` | Token budget for models whose context size pr-agent does not already know |
 | `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | unset | Optional Langfuse observability |
 
-!!! warning "AGENT_CARD_HOST / AGENT_CARD_PORT — the one thing to get right"
+:::warning[AGENT_CARD_HOST / AGENT_CARD_PORT — the one thing to get right]
 
-    These two variables set the URL the agent advertises in `supportedInterfaces`. Leave them
-    unset and the card advertises `http://localhost:9000/`, which is reachable only from
-    inside the container itself. The failure this causes is **silent and late**: registration
-    with MOSAICO succeeds, the repository stores the unreachable URL, and the reference agent
-    only fails to dereference it once it tries to route a task to this agent. Set them to
-    whatever host/port the *caller* will use to reach the container, and verify with:
+These two variables set the URL the agent advertises in `supportedInterfaces`. Leave them
+unset and the card advertises `http://localhost:9000/`, which is reachable only from
+inside the container itself. The failure this causes is **silent and late**: registration
+with MOSAICO succeeds, the repository stores the unreachable URL, and the reference agent
+only fails to dereference it once it tries to route a task to this agent. Set them to
+whatever host/port the *caller* will use to reach the container, and verify with:
 
-    ```bash
-    curl -s http://<host>:<port>/.well-known/agent-card.json \
-      | python3 -c "import sys,json; print(json.load(sys.stdin)['supportedInterfaces'][0]['url'])"
-    ```
+```bash
+curl -s http://<host>:<port>/.well-known/agent-card.json \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['supportedInterfaces'][0]['url'])"
+```
 
-    If that prints a `localhost` URL, the deployment is wrong.
+If that prints a `localhost` URL, the deployment is wrong.
+:::
 
 ### Deploy into the mosaico-demonstrator
 

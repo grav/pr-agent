@@ -14,6 +14,7 @@ from pr_agent.algo.ai_handlers.litellm_helpers import (
     litellm_callbacks_registered,
 )
 from pr_agent.algo.artifacts import inject_artifact_context as _inject_artifact_context
+from pr_agent.algo.run_details import command_failed, init_run_details
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import get_git_provider
 from pr_agent.git_providers.github_provider import IncompletePullRequestFilesError
@@ -69,11 +70,13 @@ def get_list_setting_or_env(key, fallback=None):
 
 
 async def _handle_request(url, body, notify=None):
+    # Install a fresh collector so `command_failed()` below cannot read a verdict left
+    # behind by a previous command; the tool replaces it with its own on entry.
+    init_run_details()
     result = await PRAgent().handle_request(url, body, notify=notify)
     if result is False:
-        status = _action_status.get()
-        if status is not None:
-            status.failed = True
+        _mark_action_failed()
+    _fail_on_recorded_tool_error()
 
 
 async def _handle_configured_command(url, command):
@@ -83,20 +86,41 @@ async def _handle_configured_command(url, command):
             raise ValueError("Empty configured command")
     except ValueError:
         get_logger().error("Failed to parse a configured command; skipping it.")
-        status = _action_status.get()
-        if status is not None:
-            status.failed = True
+        _mark_action_failed()
         return
     await _handle_request(url, command_args)
 
 
+def _mark_action_failed():
+    status = _action_status.get()
+    if status is not None:
+        status.failed = True
+
+
+def _fail_on_recorded_tool_error():
+    # Fail the Action on a failure the tool recorded but swallowed (propagate_tool_errors=false),
+    # so a PR that got no review is not reported green (#3705). The operator opts out with
+    # GITHUB_ACTION_CONFIG.FAIL_ON_TOOL_ERRORS=false; comment arguments cannot change it.
+    if not is_true(get_setting_or_env("GITHUB_ACTION_CONFIG.FAIL_ON_TOOL_ERRORS", True)):
+        return
+    if command_failed():
+        get_logger().warning("Tool reported success but recorded a failure; failing the action")
+        _mark_action_failed()
+
+
 async def _run_auto_tool(tool_class, pr_url):
     """Run a direct auto tool while preserving GitHub Action failure semantics."""
+    # Install a fresh collector so `command_failed()` below cannot read a verdict left
+    # behind by a previous tool; the tool replaces it with its own on entry.
+    init_run_details()
     try:
-        await tool_class(pr_url).run()
+        result = await tool_class(pr_url).run()
     except IncompletePullRequestFilesError:
         publish_incomplete_github_files_comment(pr_url)
         raise
+    if result is False:
+        _mark_action_failed()
+    _fail_on_recorded_tool_error()
 
 async def _run_review_commands(event_payload):
     action = event_payload.get("action")
@@ -258,7 +282,8 @@ async def run_action():
         action = event_payload.get("action")
 
         # Retrieve the list of actions from the configuration
-        pr_actions = get_settings().get("GITHUB_ACTION_CONFIG.PR_ACTIONS", ["opened", "reopened", "ready_for_review", "review_requested"])
+        pr_actions = get_settings().get(
+            "GITHUB_ACTION_CONFIG.PR_ACTIONS", ["opened", "reopened", "ready_for_review", "review_requested"])
 
         # Handle synchronize first so it is not captured by pr_actions
         if action == "synchronize":
@@ -322,8 +347,11 @@ async def run_action():
 
                 # Set the configuration for auto actions
                 get_settings().config.is_auto_command = True  # Set the flag to indicate that the command is auto
-                get_settings().pr_description.final_update_message = False  # No final update message when auto_describe is enabled
-                get_logger().info(f"Running auto actions: auto_describe={auto_describe}, auto_review={auto_review}, auto_improve={auto_improve}")
+                # No final update message when auto_describe is enabled
+                get_settings().pr_description.final_update_message = False
+                get_logger().info(
+                    f"Running auto actions: "
+                    f"auto_describe={auto_describe}, auto_review={auto_review}, auto_improve={auto_improve}")
 
                 # invoke by default all three tools
                 if auto_describe is None or is_true(auto_describe):
@@ -352,6 +380,17 @@ async def run_action():
                 get_logger().info("Skipping comment event from a bot sender to avoid a feedback loop")
                 return
             comment_body = event_payload.get("comment", {}).get("body")
+            # Skip comments that are not commands, mirroring the webhook guard
+            # in github_app.py. Otherwise a plain comment is lexed as an unknown
+            # command, PRAgent.handle_request returns False and the action exits 1.
+            if comment_body and isinstance(comment_body, str) and not comment_body.lstrip().startswith("/"):
+                if '/ask' in comment_body and comment_body.strip().startswith('> ![image]'):
+                    comment_body_split = comment_body.split('/ask')
+                    comment_body = '/ask' + comment_body_split[1] + ' \n' + comment_body_split[0].strip().lstrip('>')
+                    get_logger().info(f"Reformatting comment_body so command is at the beginning: {comment_body}")
+                else:
+                    get_logger().info("Ignoring comment not starting with /")
+                    return
             try:
                 if GITHUB_EVENT_NAME == "pull_request_review_comment":
                     if '/ask' in comment_body:

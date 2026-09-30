@@ -46,7 +46,14 @@ REPO_HOST_ONLY_KEYS_BY_SECTION = {
     # an operator choice, and this is what makes it one: without it, [config] is otherwise
     # repo-configurable, so a reviewed repo's .pr_agent.toml or a comment argument could
     # supply the pattern. The operator still sets it through host configuration.
+    # extra_config_url is host-only: the next apply_repo_settings() call fetches it over
+    # HTTP(S) (attaching PR_AGENT_EXTRA_CONFIG_AUTH_HEADER) and merges *every* section of the
+    # response into runtime settings without host-key filtering. A malicious reviewed repo
+    # would otherwise repoint that fetch to an arbitrary internal URL (SSRF), exfiltrate the
+    # auth header, and override secrets/model routing/output sinks wholesale. CLI arguments
+    # for it are already blocked; the repo-settings entry point now matches.
     "config": frozenset({
+        "extra_config_url",
         "description_issue_regex",
         "repo_context_max_sibling_files",
         "repo_context_sibling_repos",
@@ -60,8 +67,13 @@ REPO_HOST_ONLY_KEYS_BY_SECTION = {
 # by the repo's maintainers in .pr_agent.toml stay accepted (apply_repo_settings does not consult
 # this map); only CliArgs.validate_user_args enforces it, so repo settings and comment args do
 # not drift.
+# github_action_config.fail_on_tool_errors decides whether a tool's recorded failure fails the
+# GitHub Action. The runner reads it after the command has applied its arguments, so a comment
+# such as `/review --github_action_config.fail_on_tool_errors=false` could turn a failed review
+# into a green workflow; the workflow's operator sets it instead.
 CLI_HOST_ONLY_KEYS_BY_SECTION = {
     "config": frozenset({"repo_context_files"}),
+    "github_action_config": frozenset({"fail_on_tool_errors"}),
 }
 
 # Keys a per-directory `.pr_agent.toml` can never override, even when their section is
@@ -100,7 +112,7 @@ PER_DIRECTORY_HOST_ONLY_KEYS_BY_SECTION = {
     "pr_questions": frozenset({"resolve_threads", "use_conversation_history"}),
     "pr_code_suggestions": frozenset({
         "commitable_code_suggestions",
-        "max_number_of_calls", "parallel_calls",
+        "max_number_of_calls", "parallel_calls", "max_discussion_context_chars",
         "approve_pr_on_self_review", "demand_code_suggestions_self_review",
     }),
     "pr_similar_issue": frozenset({"force_update_dataset", "max_issues_to_scan", "vectordb", "skip_comments"}),

@@ -10,6 +10,7 @@ from starlette_context import context, request_cycle_context
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
+from pr_agent.algo.artifacts import reapply_artifact_context
 from pr_agent.algo.cli_args import CliArgs
 from pr_agent.algo.comment_identity import add_comment_identity, comment_matches_identity
 from pr_agent.algo.utils import update_settings_from_args
@@ -225,11 +226,24 @@ def parse_command(command: str) -> list[str]:
     return [action] + args
 
 
-def prepare_command(command: str) -> list[str]:
-    """Apply configured command settings while retaining argument boundaries.
+def _validation_args(args: list[str]) -> list[str]:
+    """Project setting arguments to their keys for command-line validation.
 
-    Return argv so ``PRAgent`` does not parse the command again. Quoted setting
-    values retain their string type when passed to the settings loader.
+    A mapping value sets many keys at once, so it is kept whole and every nested
+    ``section.key`` path is validated instead of only the section before ``=``.
+    """
+    return [
+        argument if CliArgs.is_mapping_arg(argument) else argument.split("=", 1)[0]
+        for argument in args
+    ]
+
+
+def prepare_command(command: str) -> list[str]:
+    """Apply validated automatic overrides and retain them for dispatch.
+
+    Apply settings now so they can control repository loading. Return the same
+    argv so ``PRAgent`` reapplies overrides after repository settings are loaded.
+    Quoted setting values retain their string type.
     """
     command_args = parse_command(command)
     if not command_args:
@@ -239,7 +253,7 @@ def prepare_command(command: str) -> list[str]:
     for argument in args:
         # Validate the key only. The value is free text - a review instruction may legitimately
         # mention openai.key or config.url - and only the key can actually set a setting.
-        is_allowed, offending_param = CliArgs.validate_user_args([argument.split("=", 1)[0]])
+        is_allowed, offending_param = CliArgs.validate_user_args(_validation_args([argument]))
         if is_allowed:
             kept.append(argument)
         else:
@@ -248,9 +262,8 @@ def prepare_command(command: str) -> list[str]:
         get_logger().error(
             "Dropping auto-command argument(s) targeting forbidden param(s): "
             + ", ".join(f"'{param}'" for param in rejected))
-        args = kept
-    other_args = update_settings_from_args(args)
-    return [action] + other_args
+    update_settings_from_args(kept)
+    return [action] + kept
 
 
 class PRAgent:
@@ -306,15 +319,20 @@ class PRAgent:
 
         # Then, apply user specific settings if exists
         if isinstance(request, str):
-            request = request.replace("'", "\\'")
             lexer = shlex.shlex(request, posix=True)
             lexer.whitespace_split = True
+            # Keep apostrophes literal without adding backslashes inside double quotes.
+            lexer.quotes = '"'
+            # Treat "#" as ordinary text. shlex drops it and everything after it as a shell
+            # comment, which silently truncated questions such as "/ask what does #123 do?".
+            # This input is a single already-parsed command, never a shell script.
+            lexer.commenters = ''
             action, *args = list(lexer)
         else:
             action, *args = request
 
         # validate args
-        is_valid, arg = CliArgs.validate_user_args(args)
+        is_valid, arg = CliArgs.validate_user_args(_validation_args(args))
         if not is_valid:
             get_logger().error(
                 f"CLI argument for param '{arg}' is forbidden. Use instead a configuration file."
@@ -367,6 +385,8 @@ class PRAgent:
                 span.set_attribute("error.message", f"Unknown command: {action}")
             return False
 
+        reapply_artifact_context()
+
         # Only after validation: an unknown action is arbitrary user input and
         # must not become a span name, span attribute, or metric label.
         span.update_name(f"pr_agent {action}")
@@ -392,7 +412,11 @@ class PRAgent:
                     if notify:
                         notify()
 
-                    await command2class[action](pr_url, ai_handler=self.ai_handler, args=args).run()
+                    result = await command2class[action](pr_url, ai_handler=self.ai_handler, args=args).run()
+                    if action == "add_docs" and result is False:
+                        span.set_status(StatusCode.ERROR)
+                        span.set_attribute("error.type", "documentation_publication_failed")
+                        return False
 
                 span.set_status(StatusCode.OK)
                 return True

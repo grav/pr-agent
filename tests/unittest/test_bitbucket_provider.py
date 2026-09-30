@@ -101,6 +101,51 @@ class TestBitbucketProvider:
 
         assert provider.edit_comment(comment, "updated body") is False
 
+    def test_edit_comment_updates_the_payload_returned_by_publish_comment(self):
+        # publish_comment returns the raw API payload, which carries no update method of its own,
+        # so the edit has to reach Bitbucket through the pull request endpoint.
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        provider.max_comment_length = 1000
+        provider.pr = MagicMock()
+        comment = {"id": 42, "type": "pullrequest_comment", "content": {"raw": "progress"}}
+
+        assert provider.edit_comment(comment, "updated body") is True
+
+        provider.pr.put.assert_called_once_with(
+            "comments/42", data={"content": {"raw": "updated body"}}
+        )
+
+    def test_edit_comment_truncates_a_payload_body_over_the_comment_limit(self):
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        provider.max_comment_length = 50
+        provider.pr = MagicMock()
+        comment = {"id": 42, "content": {"raw": "progress"}}
+
+        assert provider.edit_comment(comment, "a" * 200) is True
+
+        sent = provider.pr.put.call_args.kwargs["data"]["content"]["raw"]
+        assert len(sent) <= provider.max_comment_length
+
+    def test_edit_comment_returns_false_when_updating_a_payload_fails(self):
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        provider.max_comment_length = 1000
+        provider.pr = MagicMock()
+        provider.pr.put.side_effect = HTTPError("edit failed")
+
+        assert provider.edit_comment({"id": 42}, "updated body") is False
+
+    def test_edit_comment_updates_a_comment_object_through_the_client(self):
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        provider.max_comment_length = 1000
+        provider.pr = MagicMock()
+        cloud_comment = MagicMock()
+        comment = SimpleNamespace(body="progress", _cloud_comment=cloud_comment)
+
+        assert provider.edit_comment(comment, "updated body") is True
+
+        cloud_comment.update.assert_called_once_with(content={"raw": "updated body"})
+        provider.pr.put.assert_not_called()
+
     def test_publish_description_raises_on_non_success_response(self):
         provider = BitbucketProvider.__new__(BitbucketProvider)
         provider.bitbucket_pull_request_api_url = "https://api.bitbucket.org/pullrequests/1"
@@ -735,6 +780,24 @@ index 1111111..2222222 100644
         for response in responses:
             response.raise_for_status.assert_called_once_with()
 
+    def test_publish_code_suggestions_preserves_backslashes_in_diff(self):
+        provider = self._provider_for_code_suggestions()
+        provider.publish_inline_comments = MagicMock(return_value=True)
+        suggestion = self._code_suggestion(2)
+        suggestion["body"] = '```suggestion\npattern = r"\\d+"\n```'
+        suggestion["original_suggestion"] = {
+            "existing_code": 'pattern = r"\\w+"',
+            "improved_code": 'pattern = r"\\d+"',
+        }
+
+        result = provider.publish_code_suggestions([suggestion])
+
+        assert result is True
+        post_parameters = provider.publish_inline_comments.call_args.args[0]
+        assert len(post_parameters) == 1
+        assert r"\w+" in post_parameters[0]["body"]
+        assert r"\d+" in post_parameters[0]["body"]
+
     def test_publish_code_suggestions_reports_http_failures(self):
         provider = self._provider_for_code_suggestions()
         responses = [self._inline_comment_response(403), self._inline_comment_response(500)]
@@ -1321,6 +1384,24 @@ class TestBitbucketServerProvider:
         assert result is True
         assert provider.bitbucket_client.post.call_count == 2
 
+    def test_publish_code_suggestions_preserves_backslashes_in_diff(self):
+        provider = self._provider_for_code_suggestions()
+        provider.publish_inline_comments = MagicMock(return_value=True)
+        suggestion = self._code_suggestion(2)
+        suggestion["body"] = '```suggestion\npattern = r"\\d+"\n```'
+        suggestion["original_suggestion"] = {
+            "existing_code": 'pattern = r"\\w+"',
+            "improved_code": 'pattern = r"\\d+"',
+        }
+
+        result = provider.publish_code_suggestions([suggestion])
+
+        assert result is True
+        post_parameters = provider.publish_inline_comments.call_args.args[0]
+        assert len(post_parameters) == 1
+        assert r"\w+" in post_parameters[0]["body"]
+        assert r"\d+" in post_parameters[0]["body"]
+
     def test_publish_code_suggestions_reports_failures_and_continues(self):
         provider = self._provider_for_code_suggestions()
         provider.bitbucket_client.post.side_effect = [
@@ -1633,6 +1714,8 @@ class TestBitbucketServerProvider:
                 '@@ -5,5 +5,5 @@\n to\n emulate\n a\n-real\n+fake\n file\n',
                 'Readme.md',
                 edit_type=EDIT_TYPE.MODIFIED,
+                num_plus_lines=1,
+                num_minus_lines=1,
             )
         ]
 
@@ -1693,6 +1776,8 @@ class TestBitbucketServerProvider:
                 '@@ -5,5 +5,5 @@\n to\n emulate\n a\n-real\n-file\n+fake\n+test\n',
                 'Readme.md',
                 edit_type=EDIT_TYPE.MODIFIED,
+                num_plus_lines=2,
+                num_minus_lines=2,
             )
         ]
 
@@ -1773,6 +1858,8 @@ class TestBitbucketServerProvider:
                 ),
                 'Readme.md',
                 edit_type=EDIT_TYPE.MODIFIED,
+                num_plus_lines=4,
+                num_minus_lines=4,
             )
         ]
 
@@ -1798,6 +1885,8 @@ class TestBitbucketServerProvider:
                 ),
                 'Readme.md',
                 edit_type=EDIT_TYPE.MODIFIED,
+                num_plus_lines=3,
+                num_minus_lines=3,
             )
         ]
 
@@ -1823,6 +1912,8 @@ class TestBitbucketServerProvider:
                 ),
                 'Readme.md',
                 edit_type=EDIT_TYPE.MODIFIED,
+                num_plus_lines=3,
+                num_minus_lines=3,
             )
         ]
 
@@ -1916,18 +2007,49 @@ class TestBitbucketGlobalSettings:
     def test_loads_workspace_pr_agent_settings(self):
         provider = self._provider()
         repo_resp = MagicMock(status_code=200)
-        repo_resp.json.return_value = {"mainbranch": {"name": "main"}}
+        repo_resp.json.return_value = {"mainbranch": {"name": "release/1.0"}}
+        ref_resp = MagicMock(status_code=200)
+        ref_resp.json.return_value = {"target": {"hash": "settings-sha"}}
         file_resp = MagicMock(status_code=200)
         file_resp.text = "[pr_reviewer]\nnum_max_findings = 5\n"
         with patch("pr_agent.git_providers.bitbucket_provider.requests.request",
-                   side_effect=[repo_resp, file_resp]) as rq, \
+                   side_effect=[repo_resp, ref_resp, file_resp]) as rq, \
              patch("pr_agent.git_providers.git_provider.get_settings") as ms:
             ms.return_value.config.use_global_settings_file = True
             result = provider._get_global_repo_settings()
         assert result == b"[pr_reviewer]\nnum_max_findings = 5\n"
-        assert rq.call_count == 2  # repo info + file
+        assert rq.call_count == 3  # repo info + default-branch ref + file
         assert "myws/pr-agent-settings" in rq.call_args_list[0].args[1]
-        assert "src/main/.pr_agent.toml" in rq.call_args_list[1].args[1]
+        assert "refs/branches/release%2F1.0" in rq.call_args_list[1].args[1]
+        assert "src/settings-sha/.pr_agent.toml" in rq.call_args_list[2].args[1]
+
+    @pytest.mark.parametrize("status_code", [403, 404])
+    def test_missing_or_inaccessible_default_branch_ref_returns_empty_and_caches(self, status_code):
+        provider = self._provider()
+        repo_resp = MagicMock(status_code=200)
+        repo_resp.json.return_value = {"mainbranch": {"name": "release/1.0"}}
+        ref_resp = MagicMock(status_code=status_code)
+        with patch("pr_agent.git_providers.bitbucket_provider.requests.request",
+                   side_effect=[repo_resp, ref_resp]) as rq, \
+             patch("pr_agent.git_providers.git_provider.get_settings") as ms:
+            ms.return_value.config.use_global_settings_file = True
+            assert provider._get_global_repo_settings() == ""
+            assert provider._get_global_repo_settings() == ""  # served from cache
+        assert rq.call_count == 2
+
+    def test_malformed_default_branch_ref_is_not_cached(self):
+        provider = self._provider()
+        repo_resp = MagicMock(status_code=200)
+        repo_resp.json.return_value = {"mainbranch": {"name": "main"}}
+        ref_resp = MagicMock(status_code=200)
+        ref_resp.json.return_value = {"target": {}}
+        with patch("pr_agent.git_providers.bitbucket_provider.requests.request",
+                   side_effect=[repo_resp, ref_resp, repo_resp, ref_resp]) as rq, \
+             patch("pr_agent.git_providers.git_provider.get_settings") as ms:
+            ms.return_value.config.use_global_settings_file = True
+            assert provider._get_global_repo_settings() == ""
+            assert provider._get_global_repo_settings() == ""
+        assert rq.call_count == 4
 
     def test_no_access_403_returns_empty_and_caches(self):
         # A 403 (no access) is a stable/expected condition like 404: return "" AND cache it.
@@ -1961,26 +2083,49 @@ class TestBitbucketGlobalSettings:
         provider = self._provider()
         repo_resp = MagicMock(status_code=200)
         repo_resp.json.return_value = {"mainbranch": {"name": "main"}}
+        ref_resp = MagicMock(status_code=200)
+        ref_resp.json.return_value = {"target": {"hash": "settings-sha"}}
         file_resp = MagicMock(status_code=200)
         file_resp.text = "[pr_reviewer]\nx = 1\n"
         with patch("pr_agent.git_providers.bitbucket_provider.requests.request",
-                   side_effect=[repo_resp, file_resp]) as rq, \
+                   side_effect=[repo_resp, ref_resp, file_resp]) as rq, \
              patch("pr_agent.git_providers.git_provider.get_settings") as ms:
             ms.return_value.config.use_global_settings_file = True
             provider._get_global_repo_settings()
             provider._get_global_repo_settings()
-        # Two HTTP calls total (first fetch), none on the cached second call.
-        assert rq.call_count == 2
+        # Three HTTP calls total (first fetch), none on the cached second call.
+        assert rq.call_count == 3
 
 
 class TestBitbucketLocalSettingsRobustness:
+    def test_get_repo_settings_reads_local_file_by_destination_commit(self):
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        provider.workspace_slug = "myws"
+        provider.repo_slug = "myrepo"
+        provider.headers = {"Authorization": "Bearer x"}
+        provider.pr = MagicMock(
+            destination_branch="release/1.0",
+            data={"destination": {"commit": {"hash": "destination-sha"}}},
+        )
+        resp = MagicMock(status_code=200)
+        resp.text = "[pr_reviewer]\nnum_max_findings = 5\n"
+        with patch("pr_agent.git_providers.bitbucket_provider.requests.request", return_value=resp) as rq, \
+             patch("pr_agent.git_providers.git_provider.get_settings") as ms:
+            ms.return_value.config.use_global_settings_file = False
+            result = provider.get_repo_settings()
+        assert result == [("local", b"[pr_reviewer]\nnum_max_findings = 5\n")]
+        assert "src/destination-sha/.pr_agent.toml" in rq.call_args.args[1]
+
     def test_get_repo_settings_ignores_error_response_for_local(self):
         # A non-200/404 response (e.g. 500 error page) must NOT be treated as local TOML content.
         provider = BitbucketProvider.__new__(BitbucketProvider)
         provider.workspace_slug = "myws"
         provider.repo_slug = "myrepo"
         provider.headers = {"Authorization": "Bearer x"}
-        provider.pr = MagicMock(destination_branch="main")
+        provider.pr = MagicMock(
+            destination_branch="main",
+            data={"destination": {"commit": {"hash": "destination-sha"}}},
+        )
         resp = MagicMock(status_code=500)
         resp.text = "<html>internal error</html>"
         with patch("pr_agent.git_providers.bitbucket_provider.requests.request", return_value=resp), \

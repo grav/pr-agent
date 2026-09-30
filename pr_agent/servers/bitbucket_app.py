@@ -27,6 +27,7 @@ from pr_agent.log import LoggingFormat, get_logger, setup_logger
 from pr_agent.secret_providers import get_secret_provider, validate_secret_provider_setting
 from pr_agent.servers.utils import (
     get_pr_commands,
+    is_command_comment,
     push_trigger_slot,
     shared_should_process_pr_logic,
 )
@@ -154,10 +155,12 @@ async def _validate_time_from_last_commit_to_pr_update(data: dict) -> bool:
         username =_get_username(data)
         commits_data = response.json() or {}
         values = commits_data.get('values') or []
-        if (not values or not isinstance(values, list) or not values[0].get('author') or not values[0]['author'].get('user')
+        if (not values or not isinstance(values, list)
+                or not values[0].get('author') or not values[0]['author'].get('user')
                 or not values[0]['author']['user'].get('display_name')):
-            get_logger().warning("No commits returned for pull request or one of the required fields missing; skipping push validation",
-                                 artifact={'values': values})
+            get_logger().warning(
+                "No commits returned for pull request or one of the required fields missing; skipping push validation",
+                artifact={'values': values})
             return False
         commit_username = commits_data['values'][0]['author']['user']['display_name']
         if username != commit_username:
@@ -183,7 +186,8 @@ async def _validate_time_from_last_commit_to_pr_update(data: dict) -> bool:
 
 async def _perform_commands_bitbucket(commands_conf: str, agent: PRAgent, api_url: str, log_context: dict, data: dict):
     apply_repo_settings(api_url)
-    if commands_conf == "pr_commands" and get_settings().config.disable_auto_feedback:  # auto commands for PR, and auto feedback is disabled
+    # auto commands for PR, and auto feedback is disabled
+    if commands_conf == "pr_commands" and get_settings().config.disable_auto_feedback:
         get_logger().info(f"Auto feedback is disabled, skipping auto commands for PR {api_url=}")
         return
     if commands_conf == "push_commands":
@@ -191,9 +195,11 @@ async def _perform_commands_bitbucket(commands_conf: str, agent: PRAgent, api_ur
             get_logger().info(
                 "Bitbucket push trigger handling disabled via config; skipping push commands")
             return
-    if data.get("event", "") == "pullrequest:created":
-        if not should_process_pr_logic(data):
-            return
+    # Filter both command types here, after apply_repo_settings, so repository-level
+    # ignore rules (ignore_pr_authors, ignore_pr_title, branch filters) also cover
+    # push commands on 'pullrequest:updated', like the other servers already do.
+    if not should_process_pr_logic(data):
+        return
     commands = (
         get_pr_commands("bitbucket_app")
         if commands_conf == "pr_commands"
@@ -358,6 +364,9 @@ async def handle_github_webhooks(background_tasks: BackgroundTasks, request: Req
                 log_context["api_url"] = pr_url
                 log_context["event"] = "comment"
                 comment_body = data["data"]["comment"]["content"]["raw"]
+                if not is_command_comment(comment_body):
+                    get_logger().info("Ignoring comment not starting with /")
+                    return
                 with get_logger().contextualize(**log_context):
                     if get_identity_provider().verify_eligibility("bitbucket",
                                                                      sender_id, pr_url) is not Eligibility.NOT_ELIGIBLE:
@@ -373,19 +382,38 @@ async def handle_webhook_health(request: Request, response: Response):
 
 @router.post("/installed")
 async def handle_installed_webhooks(request: Request, response: Response):
+    get_logger().info("handle_installed_webhooks")
     try:
-        get_logger().info("handle_installed_webhooks")
         data = await request.json()
-        shared_secret = data["sharedSecret"]
-        client_key = data["clientKey"]
-        username = data["principal"]["username"]
-        secrets = {
-            "shared_secret": shared_secret,
-            "client_key": client_key
-        }
+    except Exception as e:
+        get_logger().error(f"Failed to register user: invalid JSON payload ({type(e).__name__})")
+        return JSONResponse({"error": "Unable to register user"}, status_code=500)
+
+    if not isinstance(data, dict):
+        get_logger().error("Failed to register user: installation payload must be a JSON object")
+        return JSONResponse({"error": "Unable to register user"}, status_code=500)
+
+    for field in ("sharedSecret", "clientKey", "principal"):
+        if field not in data:
+            get_logger().error(f"Failed to register user: missing required field '{field}'")
+            return JSONResponse({"error": "Unable to register user"}, status_code=500)
+
+    principal = data["principal"]
+    if not isinstance(principal, dict) or "username" not in principal:
+        get_logger().error("Failed to register user: missing or invalid required field 'principal.username'")
+        return JSONResponse({"error": "Unable to register user"}, status_code=500)
+
+    shared_secret = data["sharedSecret"]
+    client_key = data["clientKey"]
+    username = principal["username"]
+    secrets = {
+        "shared_secret": shared_secret,
+        "client_key": client_key
+    }
+    try:
         get_fork_safe_secret_provider().store_secret(username, json.dumps(secrets))
     except Exception as e:
-        get_logger().error(f"Failed to register user: {e}")
+        get_logger().error(f"Failed to register user: secret provider failure ({type(e).__name__})")
         return JSONResponse({"error": "Unable to register user"}, status_code=500)
 
 @router.post("/uninstalled")
